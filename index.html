@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grid Portal</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial,Helvetica,sans-serif;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #title{position:fixed;top:14px;left:16px;font-weight:700;font-size:18px;text-shadow:0 2px 8px #000;pointer-events:none}
+  #hint{position:fixed;top:48px;left:16px;font-size:14px;color:#e4e4f0;text-shadow:0 2px 8px #000;pointer-events:none}
+  #gate{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+        background:#000;text-align:center;padding:24px}
+  #gate h1{margin:0;font-size:clamp(24px,4vw,42px)}
+  #gate p{margin:0;max-width:460px;color:#b9b9cc;line-height:1.5}
+  #start{font:700 18px Arial;padding:14px 30px;border-radius:999px;border:2px solid #fff;background:transparent;color:#fff;cursor:pointer}
+  #start:hover,#start:focus-visible{background:#fff;color:#000;outline:none}
+  #msg{color:#ff7b9c;min-height:1.4em;max-width:460px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="title">Grid Portal</div>
+<div id="hint">Frame your face with both hands (thumbs and index fingers)</div>
+<div id="gate">
+  <h1>Grid Portal</h1>
+  <p>Allow camera access, then hold both hands up like a picture frame around your face. Inside the frame your face turns into a white wireframe grid.</p>
+  <button id="start">Start camera</button>
+  <div id="msg"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
+<script>
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const video=document.createElement('video'); video.playsInline=true; video.muted=true;
+const gate=document.getElementById('gate'), msg=document.getElementById('msg');
+let W,H; function size(){W=cv.width=innerWidth;H=cv.height=innerHeight}
+addEventListener('resize',size); size();
+
+let hands=[], face=null, sf=null, busyH=false, busyF=false, lastQuad=null, miss=0;
+
+// --- models ---
+const handModel=new Hands({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'+f});
+handModel.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});
+handModel.onResults(r=>{hands=r.multiHandLandmarks||[]});
+
+const faceModel=new FaceMesh({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/'+f});
+faceModel.setOptions({maxNumFaces:1,refineLandmarks:false,minDetectionConfidence:.5,minTrackingConfidence:.5});
+faceModel.onResults(r=>{face=(r.multiFaceLandmarks&&r.multiFaceLandmarks[0])||null});
+
+// triangles recovered from the mesh's edge list (3-cycles)
+function buildTris(){
+  const adj={}, seen=new Set(), out=[];
+  FACEMESH_TESSELATION.forEach(([a,b])=>{(adj[a]=adj[a]||new Set()).add(b);(adj[b]=adj[b]||new Set()).add(a)});
+  FACEMESH_TESSELATION.forEach(([a,b])=>adj[a].forEach(c=>{
+    if(adj[b].has(c)){const t=[a,b,c].sort((x,y)=>x-y),k=t.join(',');if(!seen.has(k)){seen.add(k);out.push(t)}}
+  }));
+  return out;
+}
+let TRI=null;
+
+function geo(){const vw=video.videoWidth,vh=video.videoHeight,s=Math.max(W/vw,H/vh);return{vw,vh,s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}}
+function P(l){const g=geo();return{x:W-(g.ox+l.x*g.vw*g.s),y:g.oy+l.y*g.vh*g.s}}
+
+// --- face -> wireframe grid ---
+function facePoints(){
+  const g=geo();
+  const pts=face.map(l=>{const p=P(l);return{x:p.x,y:p.y,d:-l.z*g.vw*g.s}});
+  if(sf&&sf.length===pts.length) pts.forEach((p,i)=>{const q=sf[i];p.x=q.x+(p.x-q.x)*.6;p.y=q.y+(p.y-q.y)*.6;p.d=q.d+(p.d-q.d)*.6});
+  sf=pts; return pts;
+}
+function drawGrid(pts){
+  let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+  pts.forEach(p=>{x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y)});
+  const cols=46, cell=(x1-x0)/cols, rows=Math.ceil((y1-y0)/cell), n=cols+1, D=new Float32Array(n*(rows+1)).fill(NaN);
+  for(const t of TRI){
+    const a=pts[t[0]],b=pts[t[1]],c=pts[t[2]];
+    const den=(b.y-c.y)*(a.x-c.x)+(c.x-b.x)*(a.y-c.y); if(Math.abs(den)<1e-6) continue;
+    const gx0=Math.max(0,Math.ceil((Math.min(a.x,b.x,c.x)-x0)/cell)), gx1=Math.min(cols,Math.floor((Math.max(a.x,b.x,c.x)-x0)/cell)),
+          gy0=Math.max(0,Math.ceil((Math.min(a.y,b.y,c.y)-y0)/cell)), gy1=Math.min(rows,Math.floor((Math.max(a.y,b.y,c.y)-y0)/cell));
+    for(let gy=gy0;gy<=gy1;gy++)for(let gx=gx0;gx<=gx1;gx++){
+      const px=x0+gx*cell, py=y0+gy*cell;
+      const w1=((b.y-c.y)*(px-c.x)+(c.x-b.x)*(py-c.y))/den, w2=((c.y-a.y)*(px-c.x)+(a.x-c.x)*(py-c.y))/den, w3=1-w1-w2;
+      if(w1>=-.001&&w2>=-.001&&w3>=-.001){const d=w1*a.d+w2*b.d+w3*c.d,i=gy*n+gx; if(isNaN(D[i])||d>D[i]) D[i]=d}
+    }
+  }
+  let sum=0,cnt=0; for(const v of D) if(!isNaN(v)){sum+=v;cnt++}
+  const md=cnt?sum/cnt:0, X=(gx,v)=>x0+gx*cell+(v-md)*.55, Y=(gy,v)=>y0+gy*cell-(v-md)*.28;
+  ctx.beginPath();
+  for(let gy=0;gy<=rows;gy++){let pen=false;
+    for(let gx=0;gx<=cols;gx++){const v=D[gy*n+gx]; if(isNaN(v)){pen=false;continue}
+      pen?ctx.lineTo(X(gx,v),Y(gy,v)):ctx.moveTo(X(gx,v),Y(gy,v)); pen=true}}
+  for(let gx=0;gx<=cols;gx++){let pen=false;
+    for(let gy=0;gy<=rows;gy++){const v=D[gy*n+gx]; if(isNaN(v)){pen=false;continue}
+      pen?ctx.lineTo(X(gx,v),Y(gy,v)):ctx.moveTo(X(gx,v),Y(gy,v)); pen=true}}
+  ctx.strokeStyle='#fff'; ctx.lineWidth=1.3; ctx.lineJoin='round'; ctx.stroke();
+}
+
+// --- drawing ---
+function drawVideo(){
+  const g=geo(); ctx.save(); ctx.translate(W,0); ctx.scale(-1,1);
+  ctx.drawImage(video,g.ox,g.oy,g.vw*g.s,g.vh*g.s); ctx.restore();
+}
+function quadPath(q){ctx.beginPath();ctx.moveTo(q[0].x,q[0].y);for(let i=1;i<4;i++)ctx.lineTo(q[i].x,q[i].y);ctx.closePath()}
+function drawPortal(q){
+  ctx.save(); quadPath(q); ctx.clip();
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  if(face&&TRI) drawGrid(facePoints()); else sf=null;
+  ctx.restore();
+  quadPath(q); ctx.strokeStyle='rgba(255,255,255,.9)'; ctx.lineWidth=2; ctx.lineJoin='round';
+  ctx.shadowColor='#fff'; ctx.shadowBlur=10; ctx.stroke(); ctx.shadowBlur=0;
+  q.forEach(p=>{ctx.beginPath();ctx.arc(p.x,p.y,4,0,7);ctx.fillStyle='#fff';ctx.fill()});
+}
+
+async function tick(){
+  if(video.readyState>=2){
+    drawVideo();
+    if(!busyH){busyH=true; try{await handModel.send({image:video})}catch(e){} busyH=false}
+    if(hands.length===2){
+      const hs=hands.map(h=>h.map(P)).sort((a,b)=>a[0].x-b[0].x), A=hs[0], B=hs[1];
+      const raw=[A[4],A[8],B[8],B[4]];
+      lastQuad=lastQuad?raw.map((p,i)=>({x:lastQuad[i].x+(p.x-lastQuad[i].x)*.55,y:lastQuad[i].y+(p.y-lastQuad[i].y)*.55})):raw.map(p=>({x:p.x,y:p.y}));
+      miss=0;
+    } else if(++miss>6) lastQuad=null;
+    if(lastQuad){
+      if(!busyF){busyF=true; try{await faceModel.send({image:video})}catch(e){} busyF=false}
+      drawPortal(lastQuad);
+    } else sf=null;
+  }
+  requestAnimationFrame(tick);
+}
+
+document.getElementById('start').onclick=async()=>{
+  msg.textContent='Starting camera…';
+  try{
+    if(typeof FACEMESH_TESSELATION==='undefined') throw new Error('model');
+    TRI=buildTris();
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=stream; await video.play();
+    gate.style.display='none'; tick();
+  }catch(e){
+    msg.textContent=e.message==='model'
+      ?'Could not load the face model. Check your internet connection and reload.'
+      :'Camera unavailable. Open this page from an https:// link or http://localhost (not a preview or a content:// file) and allow camera access.';
+  }
+};
+</script>
+</body>
+</html>
