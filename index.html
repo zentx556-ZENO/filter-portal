@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter Portal</title>
+<style>
+  html,body{margin:0;height:100%;background:#07070d;color:#fff;font-family:Arial,Helvetica,sans-serif;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #title{position:fixed;top:14px;left:16px;font-weight:700;font-size:18px;text-shadow:0 2px 8px #000;pointer-events:none}
+  #hint{position:fixed;top:48px;left:16px;font-size:14px;color:#e4e4f0;text-shadow:0 2px 8px #000;pointer-events:none}
+  #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;padding:12px 12px calc(12px + env(safe-area-inset-bottom,0px));
+       overflow-x:auto;background:linear-gradient(transparent,rgba(0,0,0,.65))}
+  #bar button{flex:none;font:700 15px Arial;padding:10px 16px;border-radius:999px;border:2px solid #fff6;background:#0008;color:#fff;cursor:pointer}
+  #bar button.on{background:#fff;color:#07070d;border-color:#fff}
+  #gate{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+        background:#07070d;text-align:center;padding:24px}
+  #gate h1{margin:0;font-size:clamp(24px,4vw,42px)}
+  #gate p{margin:0;max-width:460px;color:#b9b9cc;line-height:1.5}
+  #start{font:700 18px Arial;padding:14px 30px;border-radius:999px;border:2px solid #7df9ff;background:transparent;color:#7df9ff;cursor:pointer}
+  #start:hover,#start:focus-visible{background:#7df9ff;color:#07070d;outline:none}
+  #msg{color:#ff7b9c;min-height:1.4em;max-width:460px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="title">Filter Portal</div>
+<div id="hint">Frame your face with both hands (thumbs and index fingers)</div>
+<div id="gate">
+  <h1>Filter Portal</h1>
+  <p>Allow camera access, then hold both hands up like a picture frame. Everything inside the frame gets a random filter that keeps changing.</p>
+  <button id="start">Start camera</button>
+  <div id="msg"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const video=document.createElement('video'); video.playsInline=true; video.muted=true;
+const gate=document.getElementById('gate'), msg=document.getElementById('msg'), hint=document.getElementById('hint');
+let W,H; function size(){W=cv.width=innerWidth;H=cv.height=innerHeight}
+addEventListener('resize',size); size();
+
+const FILTERS=['Violet','Thermal','Grayscale','Sketch','Teal','Sepia','Invert','Pixel'];
+let cur=Math.floor(Math.random()*FILTERS.length), hands=[], busy=false, lastQuad=null, miss=0, shown=false;
+
+// random filters: new one when the frame appears, every 3 seconds, and on tap or Space
+function reroll(){let n;do{n=Math.floor(Math.random()*FILTERS.length)}while(n===cur);cur=n;
+  hint.textContent='Filter: '+FILTERS[cur]}
+setInterval(()=>{if(lastQuad)reroll()},3000);
+addEventListener('pointerdown',()=>{if(gate.style.display==='none')reroll()});
+addEventListener('keydown',e=>{if(e.code==='Space')reroll()});
+
+// hand tracking
+const model=new Hands({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'+f});
+model.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});
+model.onResults(r=>{hands=r.multiHandLandmarks||[]});
+
+function geo(){const vw=video.videoWidth,vh=video.videoHeight,s=Math.max(W/vw,H/vh);return{vw,vh,s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}}
+function P(l){const g=geo();return{x:W-(g.ox+l.x*g.vw*g.s),y:g.oy+l.y*g.vh*g.s}}
+
+// low-res filter canvas
+const lo=document.createElement('canvas'), lx=lo.getContext('2d',{willReadFrequently:true});
+const JET=[];for(let i=0;i<256;i++){const v=i/255,c=x=>Math.max(0,Math.min(1,x));
+  JET.push([255*c(1.5-Math.abs(4*v-3)),255*c(1.5-Math.abs(4*v-2)),255*c(1.5-Math.abs(4*v-1))])}
+
+function processFrame(){
+  const g=geo(), w=320, h=Math.round(w*g.vh/g.vw);
+  if(lo.width!==w||lo.height!==h){lo.width=w;lo.height=h}
+  lx.drawImage(video,0,0,w,h);
+  const img=lx.getImageData(0,0,w,h), d=img.data, f=cur;
+  if(f===3){ // sketch: Sobel edges on white paper
+    const gr=new Uint8Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4,j++) gr[j]=.299*d[i]+.587*d[i+1]+.114*d[i+2];
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+      let v=255;
+      if(x>0&&y>0&&x<w-1&&y<h-1){
+        const i=y*w+x;
+        const gx=-gr[i-w-1]+gr[i-w+1]-2*gr[i-1]+2*gr[i+1]-gr[i+w-1]+gr[i+w+1];
+        const gy=-gr[i-w-1]-2*gr[i-w]-gr[i-w+1]+gr[i+w-1]+2*gr[i+w]+gr[i+w+1];
+        v=255-Math.min(255,Math.hypot(gx,gy)*1.8);
+      }
+      const o=(y*w+x)*4; d[o]=d[o+1]=d[o+2]=v; d[o+3]=255;
+    }
+  } else {
+    const src=f===7?new Uint8ClampedArray(d):null, B=10;
+    for(let i=0;i<d.length;i+=4){
+      let r=d[i],gg=d[i+1],b=d[i+2];
+      if(f===7){
+        const p=i>>2, x=p%w, y=(p/w)|0;
+        const sx=Math.min(w-1,((x/B)|0)*B+(B>>1)), sy=Math.min(h-1,((y/B)|0)*B+(B>>1)), j=(sy*w+sx)*4;
+        d[i]=src[j];d[i+1]=src[j+1];d[i+2]=src[j+2];continue;
+      }
+      const l=(.299*r+.587*gg+.114*b)|0;
+      switch(f){
+        case 0: d[i]=l*.7+40; d[i+1]=l*.1; d[i+2]=l*.9+60; break;
+        case 1: {const c=JET[l]; d[i]=c[0]; d[i+1]=c[1]; d[i+2]=c[2]; break}
+        case 2: d[i]=d[i+1]=d[i+2]=l; break;
+        case 4: d[i]=l*.2; d[i+1]=l*.8+30; d[i+2]=l*.9+40; break;
+        case 5: d[i]=.393*r+.769*gg+.189*b; d[i+1]=.349*r+.686*gg+.168*b; d[i+2]=.272*r+.534*gg+.131*b; break;
+        case 6: d[i]=255-r; d[i+1]=255-gg; d[i+2]=255-b; break;
+      }
+    }
+  }
+  lx.putImageData(img,0,0);
+}
+
+function drawVideo(){
+  const g=geo();
+  ctx.save(); ctx.translate(W,0); ctx.scale(-1,1);
+  ctx.drawImage(video,g.ox,g.oy,g.vw*g.s,g.vh*g.s); ctx.restore();
+}
+
+function quadPath(q){ctx.beginPath();ctx.moveTo(q[0].x,q[0].y);for(let i=1;i<4;i++)ctx.lineTo(q[i].x,q[i].y);ctx.closePath()}
+
+function drawPortal(q){
+  processFrame();
+  const g=geo();
+  ctx.save(); quadPath(q); ctx.clip();
+  ctx.translate(W,0); ctx.scale(-1,1); ctx.imageSmoothingEnabled=cur!==7;
+  ctx.drawImage(lo,g.ox,g.oy,g.vw*g.s,g.vh*g.s); ctx.restore();
+  quadPath(q); ctx.strokeStyle='rgba(255,255,255,.9)'; ctx.lineWidth=2; ctx.lineJoin='round';
+  ctx.shadowColor='#fff'; ctx.shadowBlur=10; ctx.stroke(); ctx.shadowBlur=0;
+  q.forEach(p=>{ctx.beginPath();ctx.arc(p.x,p.y,4,0,7);ctx.fillStyle='#fff';ctx.fill()});
+}
+
+async function tick(){
+  if(video.readyState>=2){
+    drawVideo();
+    if(!busy){busy=true; try{await model.send({image:video})}catch(e){} busy=false}
+    if(hands.length===2){
+      const hs=hands.map(h=>h.map(P)).sort((a,b)=>a[0].x-b[0].x), A=hs[0], B=hs[1];
+      const raw=[A[4],A[8],B[8],B[4]];
+      lastQuad=lastQuad?raw.map((p,i)=>({x:lastQuad[i].x+(p.x-lastQuad[i].x)*.55,y:lastQuad[i].y+(p.y-lastQuad[i].y)*.55})):raw.map(p=>({x:p.x,y:p.y}));
+      miss=0;
+    } else if(++miss>6) lastQuad=null;
+    if(lastQuad){ if(!shown){shown=true;reroll()} drawPortal(lastQuad) } else shown=false;
+  }
+  requestAnimationFrame(tick);
+}
+
+document.getElementById('start').onclick=async()=>{
+  msg.textContent='Starting camera…';
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=stream; await video.play();
+    gate.style.display='none'; tick();
+  }catch(e){
+    msg.textContent='Camera unavailable. Open this page from an https:// link or http://localhost (not a preview or a content:// file) and allow camera access.';
+  }
+};
+</script>
+</body>
+</html>
